@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!-- v1.2 变更B：单 HTML 壳 —— 双击即可在 Chrome/Edge（桌面与手机浏览器）完整游玩
+     名单 → 武器 → 对局 → 结算 → 商店 全流程，内核与小程序端零拷贝复用（见 bundle.js） -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>牛马切切切</title>
+  <style>
+    /* v1.7 L4①：手机滑屏误触系统手势四件套
+       touch-action:none      → 禁掉滚动手势接管（含下拉刷新）
+       overscroll-behavior    → 禁掉到达边界后的橡皮筋/下拉刷新
+       user-select/touch-callout/user-drag → 禁长按选中、长按弹菜单、拖拽图片
+       tap-highlight-color    → 禁 iOS/安卓点击灰色高亮块 */
+    html, body {
+      margin: 0; height: 100%; background: #000; overflow: hidden;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-overscroll-behavior: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-user-drag: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    canvas {
+      display: block;
+      touch-action: none;
+      overscroll-behavior: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <script src="bundle.js"></script>
+  <script>NiumaBundle.require('web/adapter.js').boot();</script>
+</body>
+</html>
