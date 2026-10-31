@@ -3812,6 +3812,15 @@ function createGame(env) {
       gap: SHOP.gapToNext(g.owned, g.coins)
     };
     if (pts > 0) audio.play('S9', { times: Math.min(6, Math.ceil(pts / 100)) });
+    // v1.12 埋点出口：对局结束唯一漏斗（内核零平台 API，只调注入的 env.analytics）
+    if (typeof env.analytics === 'function') {
+      try {
+        env.analytics({
+          type: 'run_end', score: r.engine.score, maxCombo: r.engine.maxCombo,
+          points: pts, finished: !!finished, elapsed: r.elapsed || 0, rank: g.rankTier
+        });
+      } catch (e) { /* 埋点失败不影响游戏 */ }
+    }
     g.scene = 'RESULT';
   }
 
@@ -6111,6 +6120,8 @@ function boot() {
     audio,
     host,
     modal: domModal,
+    // v1.12 埋点：内核对局结束经此上报（壳层桥接 web/analytics.js，内核零平台 API）
+    analytics: (p) => { try { if (window.NiumaStats) window.NiumaStats.trackRun(p); } catch (e) {} },
     // v1.4 变更F 3.2：离屏画布工厂（壳层允许 DOM；内核只经注入接口使用）
     createCanvas: (w, h) => {
       try {
