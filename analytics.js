@@ -155,15 +155,32 @@
     hideBar();
   }
 
+  // ---------- 对局生命周期：计算「离开时玩了几秒」----------
+  var runActive = false, runStartTs = 0;
+  function runStart() { runActive = true; runStartTs = Date.now(); }
+  function runEnd(p) {
+    if (!runActive) { runActive = false; return; }
+    runActive = false;
+    var score = (p && p.score) | 0;
+    var meta = 'fin=1;cmb=' + ((p && p.maxCombo) | 0) + ';sec=' + ((p && p.elapsed) | 0) + ';rank=' + ((p && p.rank) || 0);
+    send({ event: 'run_end', value: score, meta: meta });
+  }
+  function leaveBounce() {
+    if (!runActive) return;
+    var sec = Math.max(0, Math.round((Date.now() - runStartTs) / 1000));
+    runActive = false;
+    send({ event: 'mid_run_leave', value: sec, meta: 'p=' + platform });
+  }
+  if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') leaveBounce();
+    });
+    if (typeof window !== 'undefined') window.addEventListener('pagehide', leaveBounce);
+  }
+
   window.NiumaStats = {
-    trackRun: function (p) {
-      if (!p || p.type !== 'run_end') return;
-      send({
-        event: 'run_end', value: p.score | 0,
-        meta: 'fin=' + (p.finished ? 1 : 0) + ';pts=' + (p.points | 0) +
-              ';cmb=' + (p.maxCombo | 0) + ';sec=' + (p.elapsed | 0) + ';rank=' + (p.rank || 0)
-      });
-    },
+    runStart: runStart,
+    runEnd: runEnd,
     showShareBar: showShareBar
   };
 })();

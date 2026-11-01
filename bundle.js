@@ -3260,6 +3260,8 @@ function createGame(env) {
       if (t) { t.staged = true; t.stageVy = t.vy; g.round.preTargets.push(t); }
     }
     g.scene = 'PLAYING';
+    // v1.14 埋点：对局开始出口（与 finishRound 的 run_end 对应；内核零平台 API）
+    if (typeof env.analytics === 'function') env.analytics({ type: 'run_start' });
   }
 
   // A1 预生成用：热身段不投 HR，直接落 normal（与 rollType 同口径但确定性，不吃 rand 序列）
@@ -6125,8 +6127,13 @@ function boot() {
     analytics: (p) => {
       try {
         if (!window.NiumaStats) return;
+        if (p && p.type === 'run_start') { window.NiumaStats.runStart(); return; }
+        if (p && p.type === 'run_end') {
+          window.NiumaStats.runEnd(p);
+          window.NiumaStats.showShareBar({ score: p.score });
+          return;
+        }
         window.NiumaStats.trackRun(p);
-        if (p && p.type === 'run_end') window.NiumaStats.showShareBar({ score: p.score });
       } catch (e) {}
     },
     // v1.4 变更F 3.2：离屏画布工厂（壳层允许 DOM；内核只经注入接口使用）
