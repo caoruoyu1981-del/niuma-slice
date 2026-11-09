@@ -177,6 +177,20 @@ function boot() {
     audio,
     host,
     modal: domModal,
+    // v1.12 埋点 / v1.13 分享触点：内核对局结束经此上报（壳层桥接 web/analytics.js，内核零平台 API）
+    // 触点只在情绪峰值（结算前一刻）出现，且必须可一键关闭。
+    analytics: (p) => {
+      try {
+        if (!window.NiumaStats) return;
+        if (p && p.type === 'run_start') { window.NiumaStats.runStart(); return; }
+        if (p && p.type === 'run_end') {
+          window.NiumaStats.runEnd(p);
+          window.NiumaStats.showShareBar({ score: p.score });
+          return;
+        }
+        window.NiumaStats.trackRun(p);
+      } catch (e) {}
+    },
     // v1.4 变更F 3.2：离屏画布工厂（壳层允许 DOM；内核只经注入接口使用）
     createCanvas: (w, h) => {
       try {

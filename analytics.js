@@ -3,7 +3,12 @@
 // 触点只出现在「对局结束」这一情绪峰值，不是主菜单摆一个按钮。
 (function () {
   'use strict';
-  var ENDPOINT = 'https://stats.daoyou.ren/track.php';
+  // v1.14 可迁移层：端点/载体/兜底域名全部来自 runtime-config.js（迁移时零代码改动）
+  var CFG = (typeof window !== 'undefined' && window.NIUMA_CONFIG) || {};
+  var ENDPOINT = CFG.beaconUrl || 'https://stats.daoyou.ren/track.php';
+  var MIRROR = CFG.beaconMirrorUrl || '';
+  var GAME = CFG.game || 'slice';
+  var FALLBACK = CFG.shareFallback || 'https://niuma.daoyou.ren/';
   var KEY_ID = 'niuma_anon_id';
   var KEY_INST = 'niuma_anon_install';
   var KEY_VISITS = 'niuma_anon_visits';
@@ -44,15 +49,20 @@
   var refHost = '';
   try { refHost = document.referrer ? new URL(document.referrer).host.slice(0, 40) : ''; } catch (e) {}
 
+  function emit(url, payloadStr, quiet) {
+    var blob = new Blob([payloadStr], { type: 'text/plain' });
+    if (navigator.sendBeacon && navigator.sendBeacon(url, blob)) return;
+    fetch(url, { method: 'POST', body: blob, keepalive: true, mode: 'cors' })
+      .then(function () { if (!quiet) fails = 0; })
+      .catch(function () { if (!quiet && ++fails >= 5) disabled = true; });
+  }
   function send(p) {
     if (disabled) return;
-    var payload = { anon_id: anonId, channel: channel, ref: ref, event: p.event, value: p.value | 0, meta: p.meta || '' };
+    var payload = { anon_id: anonId, channel: channel, ref: ref, game: GAME, event: p.event, value: p.value | 0, meta: p.meta || '' };
     try {
-      var blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
-      if (navigator.sendBeacon && navigator.sendBeacon(ENDPOINT, blob)) return;
-      fetch(ENDPOINT, { method: 'POST', body: blob, keepalive: true, mode: 'cors' })
-        .then(function () { fails = 0; })
-        .catch(function () { if (++fails >= 5) disabled = true; });
+      var str = JSON.stringify(payload);
+      emit(ENDPOINT, str, false);                       // 主库：保留失败熔断
+      if (MIRROR) { try { emit(MIRROR, str, true); } catch (e2) {} } // 迁移双写：静默，绝不拖累主链路
     } catch (e) { if (++fails >= 5) disabled = true; }
   }
 
@@ -66,7 +76,7 @@
   function shareUrl() {
     try {
       return location.origin + location.pathname + '?r=' + encodeURIComponent(anonId);
-    } catch (e) { return 'https://niuma.daoyou.ren/'; }
+    } catch (e) { return FALLBACK; }
   }
   function copyLink(url) {
     try {

@@ -5580,7 +5580,11 @@ const EVENTS = {
 };
 
 // 各事件最小间隔（秒）——S6/S7 为契约限流项（S6 同帧最多 1 次、S7 防刺耳）
-const MIN_GAP = { S1: 0, S2: 0, S3: 0, S4: 0.15, S5: 0.2, S6: 0.06, S7: 0.03, S8: 2, S9: 0, S10: 0.1 };
+// v1.8 防噪音墙：限流间隔必须 ≥ 该音效的实际时长，否则快速滑动时多层叠加会听成"持续背景噪音"。
+// 实测旧值 S7=0.03（33 次/秒，单发 0.08s → 2~3 层重叠）、S6=0.06（0.62s 低频嗡鸣 → 最多 10 层）。
+// 间隔 ≥ 音效实际时长（含 0.02s 尾巴），保证同类音效零重叠：S6=0.62+0.02、S7=0.08+0.02。
+// S1 是短促打击音，连击需要能连响 → 只防同帧叠爆（0.04），不做零重叠限制。
+const MIN_GAP = { S1: 0.04, S2: 0, S3: 0, S4: 0.15, S5: 0.2, S6: 0.66, S7: 0.11, S8: 2, S9: 0, S10: 0.1 };
 
 // 契约音量（dB → 线性增益）；总输出再统一 −6dB
 const DB = { S1: -8, S2: -10, S3: -4, S4: -9, S5: -5, S6: -16, S7: -14, S8: -7, S9: -7, S10: -6 };
@@ -5874,6 +5878,12 @@ function installAutoUnlock() {
     if (!silentEl || silentEl.paused) primeIOSAudioSession();
     if (synth.running) {
       for (const ev of EVS) document.removeEventListener(ev, kick, true);
+      // v1.8 会话已激活：静音 <audio> 立即停掉。旧版 loop=true 且永不 pause，
+      // 在 iOS 上 volume 属性常被系统忽略（等同全音量），常驻循环会变成底噪。
+      if (silentEl) {
+        try { silentEl.pause(); silentEl.removeAttribute('loop'); } catch (e) {}
+        silentEl = null;
+      }
     }
   };
   for (const ev of EVS) document.addEventListener(ev, kick, { capture: true, passive: true });
@@ -5886,16 +5896,18 @@ function installAutoUnlock() {
 // 音频数据在运行时用 44 字节 WAV 头 + 全 0 采样生成，仍然零外部素材。
 let silentEl = null;
 function silentWavUrl() {
-  const sr = 8000, n = 400;                 // 8000Hz × 0.05s，8bit 单声道静音
-  const buf = new ArrayBuffer(44 + n);
+  // v1.8：改用 16bit 有符号全 0。旧版 8bit 无符号（128=静音）在个别解码器被当有符号解析
+  // 会变成满幅直流 → 循环播放就是持续噪声。16bit 全 0 没有任何解释歧义。
+  const sr = 8000, frames = 400, bytes = frames * 2;   // 8000Hz × 0.05s，16bit 单声道
+  const buf = new ArrayBuffer(44 + bytes);
   const v = new DataView(buf);
   const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  ws(0, 'RIFF'); v.setUint32(4, 36 + n, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  ws(0, 'RIFF'); v.setUint32(4, 36 + bytes, true); ws(8, 'WAVE'); ws(12, 'fmt ');
   v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, sr, true); v.setUint32(28, sr, true);
-  v.setUint16(32, 1, true); v.setUint16(34, 8, true);
-  ws(36, 'data'); v.setUint32(40, n, true);
-  for (let i = 0; i < n; i++) v.setUint8(44 + i, 128);   // 8bit 无符号，128 = 静音
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true);        // byteRate = sr × 1ch × 2B
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);             // blockAlign = 2B
+  ws(36, 'data'); v.setUint32(40, bytes, true);
+  // ArrayBuffer 默认全 0 = 16bit 有符号静音，无需填采样
   return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
 function primeIOSAudioSession() {

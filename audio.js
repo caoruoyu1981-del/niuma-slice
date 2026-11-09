@@ -34,6 +34,12 @@ function installAutoUnlock() {
     if (!silentEl || silentEl.paused) primeIOSAudioSession();
     if (synth.running) {
       for (const ev of EVS) document.removeEventListener(ev, kick, true);
+      // v1.8 会话已激活：静音 <audio> 立即停掉。旧版 loop=true 且永不 pause，
+      // 在 iOS 上 volume 属性常被系统忽略（等同全音量），常驻循环会变成底噪。
+      if (silentEl) {
+        try { silentEl.pause(); silentEl.removeAttribute('loop'); } catch (e) {}
+        silentEl = null;
+      }
     }
   };
   for (const ev of EVS) document.addEventListener(ev, kick, { capture: true, passive: true });
@@ -46,16 +52,18 @@ function installAutoUnlock() {
 // 音频数据在运行时用 44 字节 WAV 头 + 全 0 采样生成，仍然零外部素材。
 let silentEl = null;
 function silentWavUrl() {
-  const sr = 8000, n = 400;                 // 8000Hz × 0.05s，8bit 单声道静音
-  const buf = new ArrayBuffer(44 + n);
+  // v1.8：改用 16bit 有符号全 0。旧版 8bit 无符号（128=静音）在个别解码器被当有符号解析
+  // 会变成满幅直流 → 循环播放就是持续噪声。16bit 全 0 没有任何解释歧义。
+  const sr = 8000, frames = 400, bytes = frames * 2;   // 8000Hz × 0.05s，16bit 单声道
+  const buf = new ArrayBuffer(44 + bytes);
   const v = new DataView(buf);
   const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  ws(0, 'RIFF'); v.setUint32(4, 36 + n, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  ws(0, 'RIFF'); v.setUint32(4, 36 + bytes, true); ws(8, 'WAVE'); ws(12, 'fmt ');
   v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, sr, true); v.setUint32(28, sr, true);
-  v.setUint16(32, 1, true); v.setUint16(34, 8, true);
-  ws(36, 'data'); v.setUint32(40, n, true);
-  for (let i = 0; i < n; i++) v.setUint8(44 + i, 128);   // 8bit 无符号，128 = 静音
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true);        // byteRate = sr × 1ch × 2B
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);             // blockAlign = 2B
+  ws(36, 'data'); v.setUint32(40, bytes, true);
+  // ArrayBuffer 默认全 0 = 16bit 有符号静音，无需填采样
   return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
 function primeIOSAudioSession() {
