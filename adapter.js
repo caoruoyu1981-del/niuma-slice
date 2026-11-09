@@ -125,6 +125,10 @@ function boot() {
   } catch (e) {}
   const rand = mulberry32(seed);
 
+  // 性能探针开关（docs/性能测量规格-v1.md §2.1）：boot 期判定一次。
+  // 默认态（无 ?perf=1）只做一次字符串正则，不加载探针模块、不建 DOM、不挂监听、不建定时器。
+  const PERF_ON = /[?&]perf=1(&|$)/.test(window.location.search || '');
+
   // v1.5 H1：开局先做旧键迁移（双前缀 → 单前缀），再读存档
   migrateLegacyStorage();
 
@@ -252,16 +256,36 @@ function boot() {
   document.addEventListener('gesturestart', (e) => { e.preventDefault(); }, { passive: false });
   document.addEventListener('dblclick', (e) => { e.preventDefault(); }, { passive: false });
 
+  // ===== 性能探针接线（docs/性能测量规格-v1.md）=====
+  // 只在 ?perf=1 时加载壳层模块并接线；默认态 perfHost 恒为 null →
+  // frame() 里 `if (perfHost)` 是每帧唯一一次布尔判断（boot 期已是常量，恒假），零 DOM / 零监听 / 零定时器。
+  // 探针只读 game._debug / getTier() / noteFrame() 返回值，不改任何游戏逻辑与绘制路径。
+  let perfHost = null;
+  if (PERF_ON) {
+    try {
+      const hostMod = require('./perf-probe-host.js');
+      const flags = hostMod.parseQuery(window.location.search);
+      perfHost = hostMod.createHost({
+        overlay: flags.overlay,
+        diag: flags.diag,
+        canvas,
+        dpr,
+        canvasPx: { w: canvas.width, h: canvas.height },
+        canvasCssPx: { w: window.innerWidth, h: window.innerHeight },
+        viewScale,
+        getGame: () => game
+      });
+      perfHost.attach(game);
+    } catch (e) { perfHost = null; }   // 探针失败绝不影响可玩性
+  }
+
   // B5 固定逻辑步长：渲染按 rAF，逻辑按 1/60 fixed timestep 累积推进
   const STEP = 1 / 60;
   const MAX_STEPS = 5; // 卡顿帧上限，防螺旋死亡
   let last = performance.now();
   let acc = 0;
-  function frame(ts) {
-    let dt = (ts - last) / 1000;
-    last = ts;
-    if (dt > 0.25) dt = 0.25;
-    if (game.noteFrame) game.noteFrame(dt * 1000); // v1.4 12.6 B3：真实帧时驱动分档
+  // 逻辑推进 + 渲染（默认路径与探针路径共用同一实现，避免两套帧循环漂移）
+  function advance(dt) {
     acc += dt;
     let n = 0;
     while (acc >= STEP && n < MAX_STEPS) { game.update(STEP); acc -= STEP; n++; }
@@ -272,6 +296,22 @@ function boot() {
     ctx.scale(viewScale, viewScale);
     game.render(ctx);
     ctx.restore();
+  }
+  function frame(ts) {
+    const prevTs = last;                          // 原始帧差（未 clamp）供探针判 clampHits（规格 T3）
+    let dt = (ts - prevTs) / 1000;
+    last = ts;
+    if (dt > 0.25) dt = 0.25;
+    const tierEvent = game.noteFrame ? game.noteFrame(dt * 1000) : null; // v1.4 12.6 B3：真实帧时驱动分档（返回值只供探针记录档位事件）
+    // ↓ 每帧唯一一次布尔判断：perfHost 是 boot 期一次性判定的常量（默认态恒为 null → 分支永不进入）
+    if (perfHost) {
+      const t0 = performance.now();                                    // jsMs 起点（包住 update+render 墙钟）
+      advance(dt);
+      perfHost.tick(dt * 1000, performance.now() - t0, ts - prevTs, tierEvent);
+      window.requestAnimationFrame(frame);
+      return;
+    }
+    advance(dt);
     window.requestAnimationFrame(frame);
   }
   window.requestAnimationFrame(frame);

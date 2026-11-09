@@ -2434,6 +2434,792 @@ class Particles {
 module.exports = { Particles, SPAWN_DUR, CHUNK_LIFE };
 
 });
+__d("game/perf-probe.js", function(require,module,exports){
+// game/perf-probe.js —— 切切切性能探针 · 纯统计内核（规格：docs/性能测量规格-v1.1.md，probeVersion v1.1 / schema 2）
+//
+// 契约（规格 §2.2 / §6.3 / §11）：
+//   · 零平台 API：只接收壳层注入的计数与时间戳（nowMs 可注入），可 node 单测（tests/perf-probe.js）
+//   · 只读：不写任何游戏字段、不调 update/render、不碰 ctx；壳层负责读 game._debug / game.getTier()
+//     / game.noteFrame() 返回值，本文件只做统计与快照组装
+//   · 零热路径分配：每帧 frame(...) 只写类型化数组与累加器，不建对象、不建闭包、不拼字符串
+//   · 分位数用「计数直方图」增量维护（O(1)/帧），不每帧、也不每次快照全量 sort
+//     → 分辨率 = 桶宽，frameMs/jsMs 桶宽 0.25ms（误差 ≤±0.125ms）
+//     → 选直方图而非「快照时排序 2000 帧」的理由：排序成本随段内帧数线性涨（30s ≈1800 帧），
+//       而 P2 判据阈值是 22.2ms，0.125ms 的量化误差不影响任何判据成立与否（规格 §5 判据都是 ≥2× 或 ≥3ms 级）
+//
+// 单位：时间一律 ms，尺寸一律 CSS 逻辑像素（canvasPx 为设备像素），overdrawPx 为设备像素²估算。
+//
+// ---- v1.1 相对 v1 的契约变更（依据：docs/性能测量规格-v1.1.md §11；QA 验收 923de0c 的整改）----
+//   §11.5  probeVersion 'v1.1' + schema 2（与规格版本对齐）
+//   §2.4   framesRaw 增第 7 列 overdrawPx（Float32Array），7 列 × 2000 帧
+//   §2.6   snapshot() 增 pxPerMsByDropBin（四箱 {bin,n,p50}，独立增量直方图）= P1b 唯一合法输入
+//   §2.7   CAP_FRAMES 600 → 2000（30s@60fps≈1800 帧必须全段落环，否则 P1a/P7 的段首窗口被覆盖）
+//   §2.8   thermalDrift：段内帧数 < 2×300 返回 null（短段首尾窗重叠 → 恒 ≈1.00 的假阴性）
+//   §11.7  input.audioPlayEst 删除且**不留别名**；改用 input.hitBladesProc / hitBladesPerSec
+//   §2.5   overdrawPx 改用 canonical `easeOutElastic(bornNorm, 0.3)`（与 particles.js:166 同式同参）
+//   §2.4   exportText({fromRow,maxRows}) 分段导出（小程序剪贴板可能截断 2000 行）
+
+'use strict';
+
+const PROBE_VERSION = 'v1.1';
+const SCHEMA = 2;
+const CAP_FRAMES = 2000;       // framesRaw 环形容量：规格 §2.7 容量规则 = 段时长(s)×60fps + 200 余量；
+                               // S2=30s → ≥2000（覆盖 ~1800 帧）。若 S2 加长到 60s 必须提到 4000 并重跑 TQ-9
+const TIER_EVENT_CAP = 64;     // tierEvents 上限（防无界增长）
+const COST_CAP = 32;           // probeCostMs 自计窗口
+
+// 直方图桶宽（ms / 无量纲比例）
+const BUCKET_MAIN_MS = 0.25;   // frameMs / jsMs 主直方图
+const BUCKET_BIN_MS = 0.5;     // 按 drops 分箱的 frameMs 直方图
+const BUCKET_RATIO = 0.01;     // jsMs/frameMs 分箱直方图（0..1）
+const MAX_MS = 1200;           // 最大可表示帧时（壳层 clamp 上限 250ms，留余量）
+
+// 按 drops 分箱的 pxPerMs 直方图（规格 §2.6 = P1b 的唯一合法输入）
+// 量级估算：300 drops × π·(12)² ≈ 1.4e5 px²，/16ms ≈ 8.5e3 px/ms；极端（dpr3 + 满屏 + 弹跳峰值）≤2e5 px/ms。
+// 桶宽 20 px/ms（绝对宽度）：p50 量化误差 ≤±10 px/ms；规格 TQ-10 要求"直方图 p50 vs framesRaw 复算 p50"
+// 相对误差 ≤5% → 20 px/ms 在 p50 ≥200 px/ms 时满足（实测量级 1e3~1e5，余量充裕）；
+// 取 log 桶可全量程均匀，但 p50 插值会引入口径分歧，规格要求单一可复算口径 → 不取。
+const BUCKET_PXMS = 20;
+const MAX_PXMS = 200000;
+
+// 按每帧 drops 分箱（规格 §2.4 / 判据 P1a / P1b / P5）
+const DROP_BINS = [
+  { bin: '0-99', lo: 0, hi: 99 },
+  { bin: '100-199', lo: 100, hi: 199 },
+  { bin: '200-299', lo: 200, hi: 299 },
+  { bin: '300+', lo: 300, hi: Infinity }
+];
+
+// 阶段（规格 §3.2 采样段）：壳层只报 scene/roundState，段名由内核派生
+const PHASE_LABEL = { S0: '静置', S1: '倒计时', S2: '挥刀', S3: '结算' };
+const TIER_CODE = { high: 0, mid: 1, low: 2 };
+const TIER_CHAR = ['h', 'm', 'l'];
+
+// ---------- 直方图（增量分位数） ----------
+function makeHist(bucketMs, maxMs) {
+  const nb = Math.ceil(maxMs / bucketMs) + 1;   // 末桶收溢出
+  return { bucketMs, nb, counts: new Uint16Array(nb), n: 0, sum: 0, max: 0, min: Infinity };
+}
+
+function histAdd(h, v) {
+  if (!(v > 0)) v = 0;                          // NaN / 负数归 0
+  let b = Math.floor(v / h.bucketMs);
+  if (b < 0) b = 0;
+  if (b >= h.nb) b = h.nb - 1;
+  if (h.counts[b] < 65535) h.counts[b]++;       // 单桶 65535 上限（段内帧数远小于此，防御性保留）
+  h.n++;
+  h.sum += v;
+  if (v > h.max) h.max = v;
+  if (v < h.min) h.min = v;
+}
+
+// 最近秩分位数：k = ceil(p·n)（1-based），取第 k 小；桶内按秩位置线性插值，分辨率 = 桶宽
+function histPct(h, p) {
+  if (!h.n) return 0;
+  let rank = Math.ceil(p * h.n);
+  if (rank < 1) rank = 1;
+  if (rank > h.n) rank = h.n;
+  let cum = 0;
+  for (let b = 0; b < h.nb; b++) {
+    const c = h.counts[b];
+    if (!c) continue;
+    if (cum + c >= rank) {
+      let frac = (rank - cum - 0.5) / c;
+      if (frac < 0) frac = 0;
+      if (frac > 1) frac = 1;
+      return (b + frac) * h.bucketMs;
+    }
+    cum += c;
+  }
+  return h.max;
+}
+
+function histReset(h) {
+  h.counts.fill(0);
+  h.n = 0; h.sum = 0; h.max = 0; h.min = Infinity;
+}
+
+// 固定级联直方图：环（最近 n 帧的滚动 p50）+ 前缀（段首 n 帧的 p50）
+// 用途：thermalDrift = 段末 n 帧 p50 ÷ 段首 n 帧 p50（规格 P7，判据阈值 1.15）
+// 选 n=300 而非「段 1/3」的原因：段总长未知（探针不能假设 30s），300 帧 ≈ 30s 段的 6.7s 窗口，
+// 且可 O(1) 增量维护；口径写进 snapshot().thermalDriftWindow 供复算者对齐。
+// 短段守卫：段内帧数 < 2×THERMAL_WIN 时尾部窗口还没滑动过（Σ 尾窗与段首窗重叠甚至相等）→ 比值恒 ≈1.00，
+// 是**假阴性**（S1 倒计时 / S3 结算各约 135 帧，必踩）。故 thermalDrift() 在 frames < 2×THERMAL_WIN 时返回 null。
+const THERMAL_WIN = 300;
+const THERMAL_MIN_FRAMES = 2 * THERMAL_WIN;   // 段内至少 600 帧才允许给出 thermalDrift
+
+// 速率类指标（touch/s、hit/s）的最小有效段长：段长 < 1s 时分母太小，算出来的速率没有意义
+// （亚毫秒段会把 3 次触摸放大成 6 位数）。此时 input.*PerSec 返回 null、浮层显示 `-`、seg.tooShort=true。
+const MIN_SEG_MS = 1000;
+
+function createThermal() {
+  const tail = makeHist(BUCKET_BIN_MS, MAX_MS);   // 滚动窗（最近 300 帧）
+  const ringVals = new Float32Array(THERMAL_WIN);
+  const pref = makeHist(BUCKET_BIN_MS, MAX_MS);   // 段首 300 帧
+  let ringIdx = 0, ringN = 0, seen = 0;
+  return {
+    add(v) {
+      // 前缀窗：只累计段首 300 帧
+      if (seen < THERMAL_WIN) histAdd(pref, v);
+      seen++;
+      // 滚动窗：满则先减掉最旧的（只减计数/总和，最大最小值用近似：max 只増不降，接受为估算）
+      if (ringN >= THERMAL_WIN) {
+        const old = ringVals[ringIdx];
+        let b = Math.floor(old / tail.bucketMs);
+        if (b < 0) b = 0; if (b >= tail.nb) b = tail.nb - 1;
+        if (tail.counts[b] > 0) tail.counts[b]--;
+        tail.n--; tail.sum -= old;
+      } else ringN++;
+      ringVals[ringIdx] = v;
+      ringIdx = (ringIdx + 1) % THERMAL_WIN;
+      histAdd(tail, v);
+    },
+    reset() {
+      histReset(tail); histReset(pref);
+      ringIdx = 0; ringN = 0; seen = 0;
+    },
+    prefix50() { return histPct(pref, 0.5); },
+    tail50() { return histPct(tail, 0.5); },
+    prefixN() { return pref.n; },
+    tailN() { return tail.n; }
+  };
+}
+
+// ---------- 小成本环（probeCostMs 自计，规格 N8） ----------
+function createCostRing(cap) {
+  const a = new Float32Array(cap);
+  let n = 0, h = 0;
+  return {
+    push(v) { a[h] = v; h = (h + 1) % cap; if (n < cap) n++; },
+    p50() {
+      if (!n) return 0;
+      const s = new Array(n);
+      for (let i = 0; i < n; i++) s[i] = a[i];
+      s.sort((x, y) => x - y);
+      return s[n >> 1];
+    },
+    reset() { n = 0; h = 0; }
+  };
+}
+
+// ---------- 只读取值：计数（规格 §1「已核实事实」给的准确路径，全部判空） ----------
+// 写入复用对象 out（零分配），返回 out。state === game._debug（= scenes 内部 g）
+function readCounts(state, out) {
+  const o = out || {};
+  const r = (state && state.round) ? state.round : null;
+  const p = (r && r.particles) ? r.particles : null;
+  o.drops = (p && p.drops) ? p.drops.length : 0;
+  o.shards = (p && p.shards) ? p.shards.length : 0;
+  o.puddles = (p && p.puddles) ? p.puddles.length : 0;
+  o.rings = (p && p.rings) ? p.rings.length : 0;
+  o.blades = (r && r.blades) ? r.blades.length : 0;
+  o.smears = (r && r.smears) ? r.smears.length : 0;
+  o.popups = (r && r.popups) ? r.popups.length : 0;
+  o.targets = (r && r.targets) ? r.targets.length : 0;
+  o.bloom = (r && r.bloom && r.bloom.active) ? r.bloom.active.length : 0;
+  o.strokePts = (r && r.stroke && r.stroke.points) ? r.stroke.points.length : 0;
+  return o;
+}
+
+// 段内衍生读数（scene / roundState / roundElapsedMs）
+function readPhase(state, out) {
+  const o = out || {};
+  const r = (state && state.round) ? state.round : null;
+  o.scene = (state && state.scene) || '';
+  o.roundState = r ? r.state : null;
+  o.roundElapsedMs = (r && typeof r.elapsed === 'number') ? r.elapsed * 1000 : 0;
+  o.phase = phaseOf(o.scene, o.roundState);
+  return o;
+}
+
+function phaseOf(scene, roundState) {
+  if (roundState === 'running') return 'S2';
+  if (roundState === 'countdown') return 'S1';
+  if (scene === 'PLAYING') return 'S2';        // paused 亦归 S2（暂停帧由 thermalDrift/clampHits 暴露）
+  if (scene === 'RESULT') return 'S3';
+  return 'S0';
+}
+
+// ---------- overdrawPx 估算（规格 §2.5，与 particles.js:163+ 绘制参数同源） ----------
+// overdrawPx = Σ_drops π·(r·z·scale)² + Σ_shards π·(r·z)² + Σ_puddles π·rx·ry
+//   scale = scaleFn(clamp(born / SPAWN_DUR, 0, 1), 0.3)   ← scaleFn 由**壳层注入**
+//
+// ⚠️ 量纲陷阱（规格 T9，v1 踩过）：p.born 的单位是**秒**（0 → 0.12），不是倍率。必须先除 SPAWN_DUR 归一化；
+//    照字面把 born 当倍率乘半径，半径被压到 0.12r 量级、面积压到 ~1.4% → overdrawPx 小两个数量级 → P1b 必假阴性。
+// ✅ easing 单源（规格 T10，本文件的主设计）：**生产路径的曲线不写在探针里**。
+//    壳层（web/perf-probe-host.js / pages/game/game.js）把 `FX.easeOutElastic` 作为 scaleFn 注入，
+//    探针只调用收到的函数、不持有公式 → 与 particles.js:166 永远同一条曲线，改参数只需改 game/fx.js 一处。
+//    文件底部 `bornScale` 仅是**未注入时的兜底**（node 单测 / 独立复算脚本可用），与 FX 逐字同式，
+//    并由 tests 的 TQ-8 25 点对拍断言盯着（一旦两边漂移，单测立刻红）。
+//    快照里的 overdrawModel.easing 会**写明本次用的是注入还是兜底**，复算者不必猜。
+// ---- 偏差界（规格 §2.5 三口径表 / REV-4~6；三种口径**不可同表并列、不可比绝对值**）----
+// A 口径（线性降级 scale = bornNorm）——**规格唯一允许的成本回退**：
+//     L1 单点最坏：半径低估 92.5%、面积（∝r²）低估 99.44%（t≈0.0693，该点 scale(t)/t = 13.367）
+//     L2 出生窗内子集：49.3% / 67.0%；L3 全粒子聚合（真实 overdrawPx）：7.3% / 10.1%（f=0.15）
+//     ⚠️ 若引用「49.7% / 66.6%」必须注明它是**逐粒子相对误差均值**（t 在 [0,1] 均匀采样），
+//        与 L2/L3 的「比值期望之比」是**不同统计量**（§2.5 口径歧义提示，勿混用）
+// B 口径（完全忽略出生缩放 scale ≡ 1）——**规格不允许**，仅作对照：
+//     单点最坏 半径 27.17%（= 1 − 1/1.373098）、面积 46.96%（= 1 − 1/1.8854），极值在 t≈0.13474
+//     ⚠️ 旧注释的「26.7% / 99.4%」正是 A、B 混口径的产物（26.7 属 B、99.4 属 A），已按 §2.5 改正，勿回退
+// → 任何降级都必须在每个使用处标注"线性口径"，且不同口径的 run 不可比绝对值。
+// 另注：canonical 曲线的**极值**是 1.373098（t = 0.13474）。常被引用的 1.3641 只是 f(0.125) 这个采样点的值，
+//    **不是峰值**（规格 §11.12 明令：代码/注释禁止再写 1.3641 当峰值）。
+//
+// 🔴 硬结论（规格 §2.5，写进报告首页）：overdrawPx / pxPerMs **只是趋势指标**。
+//    ① 仅可用于 P1b 的「同口径两箱比值」与浮层展示；② 绝不可当填充面积真值（禁止"这帧画了 4.2M 像素所以…"）；
+//    ③ 不可用于任何绝对面积断言；④ 不同 easing 口径的两次运行不可互相比较绝对值。
+const SPAWN_DUR_DEFAULT = 0.12;   // 与 game/particles.js:9 SPAWN_DUR 同值（此处是独立常量：内核不得 require 游戏实现）
+const ELASTIC_PERIOD = 0.3;       // 与 game/fx.js:59 默认 period / particles.js:166 传参 0.3 同值
+const PI = Math.PI;
+
+// 兜底曲线（**生产路径不走这里**：壳层注入了 FX.easeOutElastic）。
+// 与 game/fx.js:58 easeOutElastic(x, 0.3) 逐字同式；T10：双处必须同参，漂移由 TQ-8 对拍断言兜住。
+// NaN / 负数 → 0（born 缺失或脏数据不得污染总和：px += NaN 会把整帧 overdraw 变成 NaN）
+function bornScale(bornNorm) {
+  let t = bornNorm;
+  if (!(t > 0)) return 0;
+  if (t > 1) t = 1;
+  if (t === 1) return 1;
+  return Math.pow(2, -10 * t) * Math.sin((t - 0.075) * (2 * PI / ELASTIC_PERIOD)) + 1;
+}
+
+// overdrawOf(particles, opts)：opts = { scaleFn, spawnDur }
+//   scaleFn：壳层注入的出生弹跳曲线（(bornNorm) → scale）。缺省走 bornScale 兜底。
+function overdrawOf(particles, opts) {
+  if (!particles) return 0;
+  const O = opts || {};
+  const fn = (typeof O.scaleFn === 'function') ? O.scaleFn : bornScale;
+  const sd = (O.spawnDur > 0) ? O.spawnDur : SPAWN_DUR_DEFAULT;
+  let px = 0;
+  const drops = particles.drops;
+  if (drops) {
+    for (let i = 0; i < drops.length; i++) {
+      const d = drops[i];
+      const z = (d.z === undefined) ? 1 : d.z;
+      let scale = 1;
+      if (d.born !== undefined) {
+        const t = d.born / sd;
+        scale = fn((t > 0) ? (t > 1 ? 1 : t) : 0);   // 秒 → 无量纲比值 → 注入曲线
+        if (!(scale > 0)) scale = 0;                 // 注入函数返回 NaN / 负数也不得污染总和
+      }
+      const rr = d.r * z * scale;
+      px += PI * rr * rr;
+    }
+  }
+  const shards = particles.shards;
+  if (shards) {
+    for (let i = 0; i < shards.length; i++) {
+      const s = shards[i];
+      const z = (s.z === undefined) ? 1 : s.z;
+      const rr = s.r * z;
+      px += PI * rr * rr;
+    }
+  }
+  const puddles = particles.puddles;
+  if (puddles) {
+    for (let i = 0; i < puddles.length; i++) {
+      const q = puddles[i];
+      px += PI * (q.rx || 0) * (q.ry || 0);
+    }
+  }
+  return px;
+}
+
+// ---------- 探针 ----------
+function createProbe(opts) {
+  const O = opts || {};
+  const carrier = (O.carrier === 'wx') ? 'wx' : 'h5';
+  const overlay = (O.overlay !== false);
+  const nowMs = (typeof O.nowMs === 'function') ? O.nowMs : function () { return Date.now(); };
+  const bucketMain = (O.bucketMainMs > 0) ? O.bucketMainMs : BUCKET_MAIN_MS;
+  // 规格 T10 / §2.5：出生弹跳曲线由壳层注入（生产 = game/fx.js 的 FX.easeOutElastic），
+  // 内核不持公式；未注入时 snapshot().overdrawModel.easing 会显式标成 inline 兜底，复算者不用猜。
+  const scaleFn = (typeof O.scaleFn === 'function') ? O.scaleFn : null;
+
+  const startMs = nowMs();
+
+  // 画面静态信息（壳层 boot 期注入一次）
+  const view = {
+    dpr: (O.dpr > 0) ? O.dpr : 1,
+    canvasPx: { w: (O.canvasPx && O.canvasPx.w) || 0, h: (O.canvasPx && O.canvasPx.h) || 0 },
+    canvasCssPx: { w: (O.canvasCssPx && O.canvasCssPx.w) || 0, h: (O.canvasCssPx && O.canvasCssPx.h) || 0 },
+    viewScale: (O.viewScale > 0) ? O.viewScale : 1
+  };
+
+  // 环形缓冲（framesRaw，最近 ≤CAP_FRAMES 帧，零分配写入）
+  // 列序（= CSV 列序）：frameMs, jsMs, drops, shards, touches, tier, overdrawPx
+  const ring = {
+    n: 0, head: 0,
+    frameMs: new Float32Array(CAP_FRAMES),
+    jsMs: new Float32Array(CAP_FRAMES),
+    drops: new Uint16Array(CAP_FRAMES),
+    shards: new Uint16Array(CAP_FRAMES),
+    touches: new Uint16Array(CAP_FRAMES),
+    tier: new Uint8Array(CAP_FRAMES),
+    overdrawPx: new Float32Array(CAP_FRAMES)     // 第 7 列：逐帧 overdrawPx（P1b 的逐帧复算输入）
+  };
+
+  // 段级累加器（beginSeg 清零）
+  let histFrame, histJs, binFrame, binRatio, binPxMs, thermal;
+  let frameCount = 0, clampHits = 0, lastFrameMs = 0, lastJsMs = 0;
+  let maxDrops = 0, maxShards = 0, maxTargets = 0, maxOverdraw = 0, lastOverdraw = 0;
+  let touchTotal = 0, bladesProc = 0;
+  let pear = { n: 0, sx: 0, sy: 0, sxx: 0, syy: 0, sxy: 0 };
+  let tierNow = 'high';
+  let tierEvents = [];
+  let segName = 'S0', segStartTMs = 0, segFrames = 0;
+  let winFps = { ms: 0, frames: 0, min: Infinity };
+  const counts = {};           // 复用对象（零分配）
+  let costSnap = createCostRing(COST_CAP), costOverlay = createCostRing(COST_CAP);
+  const seenBlades = new WeakSet();  // bladesProc 去重（刀光对象只增一次）
+  let ended = false, endedSeg = null;
+
+  function allocSegmentBuffers() {
+    histFrame = makeHist(bucketMain, MAX_MS);
+    histJs = makeHist(bucketMain, MAX_MS);
+    binFrame = DROP_BINS.map(() => makeHist(BUCKET_BIN_MS, MAX_MS));
+    binRatio = DROP_BINS.map(() => makeHist(BUCKET_RATIO, 1));
+    // P1b 输入：按 drops 箱各自一条 pxPerMs 直方图（独立增量维护，每帧 O(1)，不遍历 framesRaw）
+    // 内存：ceil(200000/20)+1 = 10001 桶 × Uint16 = 20KB/箱 × 4 箱 = 80KB（换段时随 framesRaw 一起重建，可忽略）
+    binPxMs = DROP_BINS.map(() => makeHist(BUCKET_PXMS, MAX_PXMS));
+    thermal = createThermal();
+  }
+
+  function resetSegment(name) {
+    allocSegmentBuffers();
+    frameCount = 0; clampHits = 0; lastFrameMs = 0; lastJsMs = 0;
+    maxDrops = 0; maxShards = 0; maxTargets = 0; maxOverdraw = 0; lastOverdraw = 0;
+    touchTotal = 0; bladesProc = 0;
+    pear = { n: 0, sx: 0, sy: 0, sxx: 0, syy: 0, sxy: 0 };
+    tierEvents = [];
+    segName = name || segName;
+    segStartTMs = nowMs() - startMs;
+    segFrames = 0;
+    winFps = { ms: 0, frames: 0, min: Infinity };
+    ring.n = 0; ring.head = 0;
+    costSnap.reset(); costOverlay.reset();
+  }
+
+  resetSegment('S0');
+
+  function binOf(drops) {
+    for (let i = 0; i < DROP_BINS.length; i++) {
+      if (drops >= DROP_BINS[i].lo && drops <= DROP_BINS[i].hi) return i;
+    }
+    return DROP_BINS.length - 1;
+  }
+
+  // 刀光对象去重计数（bladesProc：r.blades 里出现过的刀光条目累计数）
+  // ⚠️ 口径：未命中任何目标的空刀不会 push 进 r.blades（scenes.js:1000 在 plainKills 分支内）
+  //    → bladesProc 是**命中刀光下界，不是音频播放次数**（规格 §11.7 要求本注释含这句）。
+  //    audio.play('S7') 在 processBlades 的 for 循环顶部无条件执行（空刀也播，scenes.js:922），
+  //    与命中次数不是同一个量 → v1.1 删除 input.audioPlayEst（不留别名），改用 input.hitBladesProc。
+  function observeBlades(arr) {
+    if (!arr || !arr.length) return;
+    for (let i = 0; i < arr.length; i++) {
+      const b = arr[i];
+      if (b && typeof b === 'object' && !seenBlades.has(b)) {
+        seenBlades.add(b);
+        bladesProc++;
+      }
+    }
+  }
+
+  // 每帧喂数（位置参数 = 零对象分配；counts 是壳层复用的对象）
+  // frameMs   ：与 game.noteFrame(dt*1000) 同源的值（可能已被壳层 clamp 到 250）
+  // rawFrameMs：未 clamp 的原始帧差（clampHits 判据只认它）
+  // jsMs      ：update+render 墙钟时长（WX 仅命令提交，见规格 §6.3）
+  // tierEvent ：game.noteFrame() 的返回值 'down'|'up'|null（探针只记录，不干预分档）
+  function frame(frameMs, rawFrameMs, jsMs, c, overdrawPx, touches, tier, tierEvent, phase) {
+    if (!(frameMs > 0)) return false;           // T4：首帧 dt=0 / 非法值丢弃
+    if (tier) tierNow = tier;
+    if (phase && phase !== segName) {
+      endedSeg = { name: segName, startTMs: segStartTMs, ms: (nowMs() - startMs) - segStartTMs, frames: segFrames };
+      resetSegment(phase);
+    }
+
+    const nT = (touches > 0) ? touches : 0;
+
+    // 帧时序 / JS 时长
+    lastFrameMs = frameMs; lastJsMs = jsMs > 0 ? jsMs : 0;
+    histAdd(histFrame, frameMs);
+    histAdd(histJs, lastJsMs);
+    thermal.add(frameMs);
+    if (rawFrameMs > 250) clampHits++;
+
+    // 1s 窗口最低 fps
+    winFps.ms += frameMs; winFps.frames++;
+    if (winFps.ms >= 1000) {
+      const f = winFps.frames * 1000 / winFps.ms;
+      if (f < winFps.min) winFps.min = f;
+      winFps.ms = 0; winFps.frames = 0;
+    }
+
+    // overdrawPx 归零（NaN / 负数 / undefined → 0），本帧只算一次，下面分箱与环形缓冲共用
+    const od = overdrawPx > 0 ? overdrawPx : 0;
+
+    // 计数快照（快照里的 counts 块与分箱用的是同一份数据，只有这一个来源 → 不会出现两处不一致）
+    const drops = c ? (c.drops | 0) : 0;
+    const shards = c ? (c.shards | 0) : 0;
+    const tgt = c ? (c.targets | 0) : 0;
+    if (c) {
+      counts.drops = drops; counts.shards = shards; counts.targets = tgt;
+      counts.puddles = c.puddles | 0; counts.rings = c.rings | 0; counts.blades = c.blades | 0;
+      counts.smears = c.smears | 0; counts.popups = c.popups | 0; counts.bloom = c.bloom | 0;
+      counts.strokePts = c.strokePts | 0;
+    }
+    const bi = binOf(drops);
+    histAdd(binFrame[bi], frameMs);
+    const share = (frameMs > 0) ? Math.min(1, lastJsMs / frameMs) : 0;
+    histAdd(binRatio[bi], share);
+    // P1b 输入：本帧 pxPerMs = overdrawPx / frameMs 落进「本帧 drops 所在的箱」的直方图（增量，不碰 framesRaw）
+    histAdd(binPxMs[bi], od / frameMs);
+
+    // Pearson r(每帧 touch 数, frameMs)（增量求和）
+    pear.n++; pear.sx += nT; pear.sy += frameMs;
+    pear.sxx += nT * nT; pear.syy += frameMs * frameMs; pear.sxy += nT * frameMs;
+
+    touchTotal += nT;
+    if (drops > maxDrops) maxDrops = drops;
+    if (shards > maxShards) maxShards = shards;
+    if (tgt > maxTargets) maxTargets = tgt;
+    lastOverdraw = od;
+    if (od > maxOverdraw) maxOverdraw = od;
+
+    // 档位变化事件（只记录，不调 FX.setTier/resetTier）
+    if (tierEvent && tierEvents.length < TIER_EVENT_CAP) {
+      tierEvents.push({ tMs: Math.round(((nowMs() - startMs) - segStartTMs) * 10) / 10, dir: tierEvent, frameMsAt: Math.round(frameMs * 10) / 10 });
+    }
+
+    // 环形缓冲写入
+    const i = ring.head;
+    ring.frameMs[i] = frameMs;
+    ring.jsMs[i] = lastJsMs;
+    ring.drops[i] = drops > 65535 ? 65535 : drops;
+    ring.shards[i] = shards > 65535 ? 65535 : shards;
+    ring.touches[i] = nT > 65535 ? 65535 : nT;
+    ring.tier[i] = TIER_CODE[tierNow] || 0;
+    ring.overdrawPx[i] = od;                       // 第 7 列（Float32 精确到 2^24，本量级 ≤4e5 无精度损失）
+    ring.head = (ring.head + 1) % CAP_FRAMES;
+    if (ring.n < CAP_FRAMES) ring.n++;
+
+    frameCount++; segFrames++;
+    return true;
+  }
+
+  function corr() {
+    const n = pear.n;
+    if (n < 3) return null;
+    const num = n * pear.sxy - pear.sx * pear.sy;
+    const d1 = n * pear.sxx - pear.sx * pear.sx;
+    const d2 = n * pear.syy - pear.sy * pear.sy;
+    if (!(d1 > 0) || !(d2 > 0)) return null;     // 方差为 0（全程无触摸或多帧同时长）→ 不可算
+    const r = num / Math.sqrt(d1 * d2);
+    return Math.round(r * 1000) / 1000;
+  }
+
+  function thermalDrift() {
+    const pN = thermal.prefixN(), tN = thermal.tailN();
+    // 段内帧数不足 2 个窗口：尾窗与段首窗重叠（甚至完全相同）→ 比值恒 ≈1.00，是假阴性，宁可 null 也不给假数
+    if (frameCount < THERMAL_MIN_FRAMES) return null;
+    if (pN < 60 || tN < 60) return null;         // 规格 §5.0：每组 n ≥ 60 才算
+    const a = thermal.prefix50();
+    if (!(a > 0)) return null;
+    return Math.round((thermal.tail50() / a) * 100) / 100;
+  }
+
+  function fpsOf(ms) { return ms > 0 ? 1000 / ms : 0; }
+  function r1(v) { return Math.round(v * 10) / 10; }
+
+  // framesRaw：按时间顺序复制出独立类型化数组（快照/导出用；浮层 opts.raw=false 跳过）
+  // 列序固定为 frameMs, jsMs, drops, shards, touches, tier, overdrawPx（与 exportText 的 CSV 同序）
+  function rawFrames() {
+    const n = ring.n;
+    const out = {
+      frameMs: new Float32Array(n), jsMs: new Float32Array(n),
+      drops: new Uint16Array(n), shards: new Uint16Array(n),
+      touches: new Uint16Array(n), tier: new Uint8Array(n),
+      overdrawPx: new Float32Array(n)
+    };
+    const start = (ring.head - n + CAP_FRAMES) % CAP_FRAMES;
+    for (let k = 0; k < n; k++) {
+      const i = (start + k) % CAP_FRAMES;
+      out.frameMs[k] = ring.frameMs[i];
+      out.jsMs[k] = ring.jsMs[i];
+      out.drops[k] = ring.drops[i];
+      out.shards[k] = ring.shards[i];
+      out.touches[k] = ring.touches[i];
+      out.tier[k] = ring.tier[i];
+      out.overdrawPx[k] = ring.overdrawPx[i];
+    }
+    return out;
+  }
+
+  function snapshot(sOpts) {
+    const t0 = nowMs();
+    const wantRaw = !(sOpts && sOpts.raw === false);
+    const secMs = (nowMs() - startMs) - segStartTMs;
+    // seg.ms 保留 1 位小数（不再取整到整数）：整数取整会让 secMs=999.7 报成 "ms=1000" 却 tooShort=true，
+    // 违反规格 §3.2 的 `tooShort === true ⇔ ms < 1000`（QA 复签 D2 实测命中）。
+    // 判定与上报用**同一个值** → 等价关系对任意输入严格成立，不留 0.5ms/0.05ms 级残窗：
+    //   999.7 → ms 999.7 / tooShort true（速率 null）；1000.0 → ms 1000 / tooShort false（速率给数）。
+    const segMsReported = Math.round(secMs * 10) / 10;
+    // 速率类指标的最小有效段长（1s）：短于此的分母会把速率放大到荒唐量级（亚毫秒段 → 6 位数字）
+    const segOk = segMsReported >= MIN_SEG_MS;
+    // p50/p95 来自直方图（桶心插值，可能略高于精确 max：例如样本全为 20.0ms 时桶心 20.125）
+    // → 用精确 max 上钳，否则浮层会显示 "p95 20.2ms  max 20.0ms" 这种自相矛盾的数字，
+    //   截图给 QA 时会被当成数据 bug（max 是精确值，分位数是估计值，估计值不得越过真值上界）
+    // 注意 max=0 的情况（整段全 0，如 pxPerMs 没粒子）：也不能让桶心插值给出 5 这种幻影值 → 一律以 max 封顶
+    const clampMax = function (v, max) { return (v > max) ? max : v; };
+    const f50 = clampMax(histPct(histFrame, 0.5), histFrame.max);
+    const f95 = clampMax(histPct(histFrame, 0.95), histFrame.max);
+    const j50 = clampMax(histPct(histJs, 0.5), histJs.max);
+    const j95 = clampMax(histPct(histJs, 0.95), histJs.max);
+
+    const frameMsByDropBin = [];
+    const jsShareByDropBin = [];
+    const pxPerMsByDropBin = [];
+    for (let i = 0; i < DROP_BINS.length; i++) {
+      frameMsByDropBin.push({
+        bin: DROP_BINS[i].bin,
+        n: binFrame[i].n,
+        p50: r1(clampMax(histPct(binFrame[i], 0.5), binFrame[i].max)),
+        p95: r1(clampMax(histPct(binFrame[i], 0.95), binFrame[i].max))
+      });
+      jsShareByDropBin.push({
+        bin: DROP_BINS[i].bin,
+        n: binRatio[i].n,
+        jsShareP50: Math.round(clampMax(histPct(binRatio[i], 0.5), binRatio[i].max) * 1000) / 1000
+      });
+      // P1b 直接输入：{bin, n, p50}；判据 = 300+箱 p50 ≤ 0.7 × 0-99箱 p50（两箱均需 n≥60）
+      // p50 同样上钳到该箱精确 max：否则单样本箱会出现 p50 > 该箱最大值，复算者（TQ-10 逐箱对拍）对不上
+      pxPerMsByDropBin.push({
+        bin: DROP_BINS[i].bin,
+        n: binPxMs[i].n,
+        p50: r1(clampMax(histPct(binPxMs[i], 0.5), binPxMs[i].max))
+      });
+    }
+
+    const snap = {
+      schema: SCHEMA,
+      probeVersion: PROBE_VERSION,
+      on: true,
+      overlay: overlay,
+      carrier,
+      tMs: Math.round(nowMs() - startMs),
+      scene: counts.scene || (O.scene || ''),
+      roundState: counts.roundState === undefined ? null : counts.roundState,
+      roundElapsedMs: counts.roundElapsedMs || 0,
+      frameCount,
+      clampHits,
+      frameMs: { last: r1(lastFrameMs), p50: r1(f50), p95: r1(f95), max: r1(histFrame.max) },
+      jsMs: { last: r1(lastJsMs), p50: r1(j50), p95: r1(j95), max: r1(histJs.max) },
+      fps: {
+        inst: r1(fpsOf(lastFrameMs)),
+        p50: r1(fpsOf(f50)),
+        p95: r1(fpsOf(f95)),
+        minWin: (winFps.min === Infinity) ? null : r1(winFps.min)
+      },
+      tier: tierNow,
+      tierEvents: tierEvents.slice(),
+      counts: {
+        drops: counts.drops | 0, shards: counts.shards | 0, puddles: counts.puddles | 0,
+        rings: counts.rings | 0, blades: counts.blades | 0, smears: counts.smears | 0,
+        popups: counts.popups | 0, bloom: counts.bloom | 0, targets: counts.targets | 0,
+        strokePts: counts.strokePts | 0
+      },
+      peaks: {
+        drops: maxDrops, shards: maxShards, targets: maxTargets,
+        overdrawPx: Math.round(maxOverdraw)
+      },
+      dpr: view.dpr,
+      canvasPx: { w: view.canvasPx.w, h: view.canvasPx.h },
+      canvasCssPx: { w: view.canvasCssPx.w, h: view.canvasCssPx.h },
+      viewScale: Math.round(view.viewScale * 1000) / 1000,
+      overdrawPx: Math.round(lastOverdraw || counts._overdraw || 0),
+      pxPerMs: Math.round(((lastOverdraw || counts._overdraw || 0) / (lastFrameMs > 0 ? lastFrameMs : 1)) * 10) / 10,
+      // 规格 §2.4【可选】口径自述：让复算者不必读码就知道 overdrawPx 用了哪条曲线（§2.5 canonical）
+      // easing 写明来源：'elastic-injected' = 壳层注入 FX.easeOutElastic（生产唯一路径）；'elastic-inline' = 未注入的兜底
+      overdrawModel: {
+        easing: scaleFn ? 'elastic-injected' : 'elastic-inline',
+        a: ELASTIC_PERIOD, spawnDur: SPAWN_DUR_DEFAULT,
+        source: scaleFn ? 'game/fx.js easeOutElastic' : 'game/perf-probe.js bornScale(兜底)'
+      },
+      input: {
+        touchMove: touchTotal,
+        // 速率类指标需要**足够长的分母**：段长 < MIN_SEG_MS 时返回 null（不是 0）。
+        // 为什么不是 0：0 会被读成"这一段真的没触发触摸/命中"，而 null 表示"分母太小，这数算不出来"。
+        // 触发场景：用户进对局 1s 内就导出、或 S1 只有 3s 但提前点导出 → 旧实现会算出 touch/s 225000 这种
+        // 荒唐数字（secMs 被压到亚毫秒级），在真机截图上看起来就是数据坏了。
+        touchMovePerSec: segOk ? Math.round((touchTotal * 1000 / secMs) * 10) / 10 : null,
+        // 命中刀光下界，不是音频播放次数（规格 §11.7 要求本注释逐字出现这句话）。
+        // r.blades 只在 plainKills 命中分支 push（scenes.js:1000），未命中的空刀不进数组；
+        // 而 audio.play('S7') 在 processBlades 的 for 顶部无条件执行（空刀也播，scenes.js:922）→ 两个不同量。
+        // 故 v1.1 删除 input.audioPlayEst **且不留别名**（保留别名会让两个量继续被混用 = QA-7 的错误来源），
+        // 音频播放次数本轮**不可得**（要精确计数只能在 audio 壳层包裹，属未批准的侵入式改动）。
+        hitBladesProc: bladesProc,
+        hitBladesPerSec: segOk ? Math.round((bladesProc * 1000 / secMs) * 10) / 10 : null
+      },
+      frameMsByDropBin,
+      jsShareByDropBin,
+      pxPerMsByDropBin,
+      corrTouchFrameMs: corr(),
+      thermalDrift: thermalDrift(),
+      thermalDriftWindow: { prefixFrames: thermal.prefixN(), tailFrames: thermal.tailN() },
+      // tooShort：段长 < MIN_SEG_MS → 速率类指标（input.*PerSec）为 null，报告据此拒用该 run 的速率类结论。
+      // 累计量（touchMove / hitBladesProc）不受影响 —— 它们是计数，不依赖分母。
+      seg: { name: segName, label: PHASE_LABEL[segName] || segName, startTMs: Math.round(segStartTMs * 10) / 10, ms: segMsReported, frames: segFrames, tooShort: !segOk },
+      probeCostMs: { snapshotP50: Math.round(costSnap.p50() * 1000) / 1000, overlayDrawP50: Math.round(costOverlay.p50() * 1000) / 1000 },
+      // 浮层第 7 行「raw n/2000」需要（规格 §2.3）：raw:false 时 framesRaw 为 null，但环内行数仍须可见 ——
+      // 现场用它判断"这一段能不能被完整独立复算"（n 撞满 CAP = 段首可能已被覆盖）
+      framesRawRows: ring.n,
+      framesRawCap: CAP_FRAMES,
+      framesRaw: wantRaw ? rawFrames() : null
+    };
+    costSnap.push(nowMs() - t0);
+    return snap;
+  }
+
+  // 紧凑 CSV（注释行 + 表头 + 行区间）；H5 走剪贴板 API，小程序走 setClipboardData
+  // 列序 = framesRaw 列序：frameMs, jsMs, drops, shards, touches, tier, overdrawPx
+  // 注释行承载"段级标量"（帧数 / 档位 / clamp / 命中刀光数 / 总行数与本次区间）——
+  //   分段导出时**每段都能独立看出**"总共多少行、这是第几段"，否则拼回来时无法判断有没有漏段（规格 T11）。
+  // 分段导出（规格 §2.4 / TQ-4 / §3.4 第 6 步）：exportText({fromRow, maxRows, maxBytes})
+  //   2000 行 × 7 列 ≈ 80–110KB，小程序剪贴板可能被**静默截断** → 两种切法：
+  //   · maxRows：按行数切（人肉分段，如 {fromRow:0,maxRows:600}）
+  //   · maxBytes：按字节预算切（壳层自动分段：小程序 copy() 传 60KB，探针给出"能装下的最大一段"）
+  //   超限时不静默截断行内内容：只整行取舍，且注释行如实写 count= 实际行数。
+  const EXPORT_COL_HEAD = 'frameMs,jsMs,drops,shards,touches,tier,overdrawPx\n';
+  function exportText(o) {
+    const n = ring.n;
+    const all = (o && o.fromRow >= 0) ? Math.floor(o.fromRow) : 0;
+    const from = all < n ? all : n;
+    let cnt = (o && o.maxRows > 0) ? Math.floor(o.maxRows) : n;
+    if (from + cnt > n) cnt = n - from;
+    if (cnt < 0) cnt = 0;
+    const maxBytes = (o && o.maxBytes > 0) ? Math.floor(o.maxBytes) : 0;
+    const start = (ring.head - n + CAP_FRAMES) % CAP_FRAMES;
+    const head = '# niuma-perf ' + PROBE_VERSION + ' carrier=' + carrier + ' seg=' + segName +
+      ' frames=' + frameCount + ' tier=' + tierNow + ' clamp=' + clampHits +
+      ' hitBlades=' + bladesProc + ' audio=na' +
+      ' rows=' + n + ' from=' + from + ' count=';   // audio=na：音频播放数不可得（不用 hitBlades 冒名）
+    // 字节预算：注释行里的 count 位数未知 → 预留 6 位（最多多留 5 字节，只会少装一行，绝不会超预算）
+    const reserve = head.length + 6 + 1 + EXPORT_COL_HEAD.length;
+    let body = '', emitted = 0;
+    for (let k = from; k < from + cnt; k++) {
+      const i = (start + k) % CAP_FRAMES;
+      const row = (Math.round(ring.frameMs[i] * 10) / 10) + ',' +
+        (Math.round(ring.jsMs[i] * 10) / 10) + ',' +
+        ring.drops[i] + ',' + ring.shards[i] + ',' + ring.touches[i] + ',' +
+        TIER_CHAR[ring.tier[i]] + ',' +
+        Math.round(ring.overdrawPx[i]) + '\n';
+      if (maxBytes && reserve + body.length + row.length > maxBytes) break;   // 整行取舍，不切半行
+      body += row; emitted++;
+    }
+    return head + emitted + '\n' + EXPORT_COL_HEAD + body;
+  }
+
+  return {
+    probeVersion: PROBE_VERSION,
+    overlay, carrier,
+    // 每帧
+    frame,
+    // overdrawPx（用 createProbe 注入的 scaleFn；壳层每帧调这个，不要自己传曲线 → 单一口径）
+    overdrawOf(particles) {
+      return overdrawOf(particles, { scaleFn: scaleFn || undefined, spawnDur: SPAWN_DUR_DEFAULT });
+    },
+    // 场景/段读数（scene / roundState / roundElapsedMs）喂给快照
+    observePhase(p, overdrawPx) {
+      counts.scene = p.scene; counts.roundState = p.roundState; counts.roundElapsedMs = p.roundElapsedMs;
+      counts._overdraw = overdrawPx || 0;
+    },
+    observeBlades,
+    noteOverlayCost(ms) { if (ms >= 0) costOverlay.push(ms); },
+    beginSeg(name) { if (name) resetSegment(name); },
+    endSeg() {
+      ended = true;
+      endedSeg = { name: segName, startTMs: segStartTMs, ms: Math.round((nowMs() - startMs) - segStartTMs), frames: segFrames };
+      return endedSeg;
+    },
+    lastEndedSeg() { return ended ? endedSeg : null; },
+    segName() { return segName; },
+    snapshot,
+    exportText,
+    // node 单测用（只读内部聚合，不改状态）
+    _stats() {
+      return {
+        n: frameCount, maxFrame: histFrame.max, maxJs: histJs.max,
+        frameSum: histFrame.sum, jsSum: histJs.sum, clampHits, bladesProc, touchTotal,
+        tierEvents: tierEvents.length
+      };
+    }
+  };
+}
+
+// overdrawPx 显示：≥0.1M 用 Mpx（与规格 §2.3 示例同口径），小数值直接给 px（"0.0Mpx" 读不出信息）
+function fmtOverdraw(px) {
+  const v = px > 0 ? px : 0;
+  return (v >= 1e5) ? (v / 1e6).toFixed(1) + 'Mpx' : Math.round(v) + 'px';
+}
+
+// ---------- 浮层排版（规格 §2.3，恰好 8 行，行序与文案按 §2.3 示例逐字对齐） ----------
+// 纯函数：两端共用同一套行格式（H5 拼成一个 <div> 的 textContent，小程序逐行 fillText），
+// 避免两端浮层口径漂移（规格 §6.1「同名字段契约」的显示侧对偶）。
+// caps = FX.tierProfile(game.getTier()) —— 斜杠后的当前上限只能来自它（禁止读 C.PERF）
+// 文案对 spec §2.3（REV-1 已定稿）的要点：
+//   · drift 后必须带窗口 `(w300/300)`：否则 null 与 "1.00" 在现场分不清（§2.8 明令禁止把 null 读成无漂移）
+//   · 第 4 行 `bladesNow` = counts.blades（**当前屏幕上的刀光条数，瞬时量**）——v1.1 初稿写 hitBlades
+//     会被读成"累计命中数"（REV-1/R4 命名修正），累计量放到第 6 行
+//   · 第 6 行 `hit/s` = input.hitBladesPerSec、`(Σ …)` = input.hitBladesProc（命中刀光下界，不是音频播放次数）；
+//     原 `ref blade/s` 与 `hit/s` 是同一个量，已合并去重，浮层里不再有两个名字指一个数
+//   · 第 7 行 `raw n/2000` = framesRawRows/framesRawCap：现场判断这段能否被完整独立复算（§2.4 R1 / §2.7）
+function formatOverlayLines(sn, caps) {
+  const fm = sn.frameMs, js = sn.jsMs, inp = sn.input, c = sn.counts;
+  const jsShare = fm.p50 > 0 ? Math.round(js.p50 / fm.p50 * 100) : 0;
+  const win = sn.thermalDriftWindow || { prefixFrames: 0, tailFrames: 0 };
+  const wTag = ' (w' + win.prefixFrames + '/' + win.tailFrames + ')';
+  const drift = ((sn.thermalDrift === null || sn.thermalDrift === undefined) ? '-' : sn.thermalDrift.toFixed(2)) + wTag;
+  const r = (sn.corrTouchFrameMs === null || sn.corrTouchFrameMs === undefined) ? '-' : sn.corrTouchFrameMs.toFixed(2);
+  const dropCap = (caps && caps.dropCap) ? caps.dropCap : 0;
+  const shardCap = (caps && caps.shardCap) ? caps.shardCap : 0;
+  const canvasMpx = (sn.canvasPx.w * sn.canvasPx.h) / 1e6;
+  // 段长显示：<1s 用 ms、≥1s 用 s（1 位小数）。
+  // 为什么必须分单位：999.7ms 用秒显示是 "1.0s"，而同屏速率是 `-`（分母不足）→ 截图看起来是
+  // "段长 1.0s 却算不出速率"的自相矛盾（QA 复签 D2 的原始症状）。显示真实毫秒数既消除矛盾，
+  // 也让测试者一眼看出"才 0.9997s，难怪速率不可判定"。
+  const segSec = (sn.seg.ms < 1000)
+    ? (sn.seg.ms.toFixed(1) + 'ms')
+    : ((sn.seg.ms / 1000).toFixed(1) + 's');
+  const segTarget = (sn.seg.name === 'S2') ? '/30s' : '';
+  const rawRows = (typeof sn.framesRawRows === 'number') ? sn.framesRawRows : 0;
+  const rawCap = (typeof sn.framesRawCap === 'number') ? sn.framesRawCap : CAP_FRAMES;
+  const hitProc = (typeof inp.hitBladesProc === 'number') ? inp.hitBladesProc : 0;
+  // 速率类指标可能是 null（段长 < MIN_SEG_MS）→ 显示 `-`，不能显示 0（0 会被读成"真没触发"）
+  const fmtRate = function (v) { return (typeof v === 'number') ? v.toFixed(0) : '-'; };
+  return [
+    // max 与 p50/p95 同精度（1 位小数）：p95 已被上钳到精确 max，若 max 用整数显示，
+    // max=24.34 会显示成 "p95 24.3ms  max 24ms"，肉眼就是 p95>max 的"坏数据"（实为格式化不一致）
+    'fps ' + sn.fps.p50.toFixed(1) + '  p50 ' + fm.p50.toFixed(1) + 'ms  p95 ' + fm.p95.toFixed(1) + 'ms  max ' + fm.max.toFixed(1) + 'ms',
+    'js ' + js.p50.toFixed(1) + 'ms (' + jsShare + '%)   clamp ' + sn.clampHits + '   drift ' + drift,
+    'tier ' + sn.tier + '  drops ' + c.drops + '/' + dropCap + '*  shards ' + c.shards + '/' + shardCap + '  tgt ' + c.targets,
+    'bladesNow ' + c.blades + '  popup ' + c.popups + '  od ' + fmtOverdraw(sn.overdrawPx) + '  px/ms ' + sn.pxPerMs.toFixed(0),
+    'dpr ' + sn.dpr + '  canvas ' + sn.canvasPx.w + 'x' + sn.canvasPx.h + ' (' + canvasMpx.toFixed(1) + 'Mpx)  scale ' + sn.viewScale.toFixed(2),
+    'touch/s ' + fmtRate(inp.touchMovePerSec) + '   hit/s ' + fmtRate(inp.hitBladesPerSec) + ' (Σ ' + hitProc + ')   r(touch,frame) ' + r,
+    'seg ' + (sn.seg.label || sn.seg.name) + ' ' + segSec + segTarget + '  frames ' + sn.frameCount + '  raw ' + rawRows + '/' + rawCap,
+    '* 斜杠后为 FX.tierProfile() 的当前上限（非 C.PERF）'
+  ];
+}
+
+module.exports = {
+  PROBE_VERSION, SCHEMA, CAP_FRAMES, DROP_BINS, PHASE_LABEL, THERMAL_WIN, THERMAL_MIN_FRAMES,
+  SPAWN_DUR_DEFAULT, ELASTIC_PERIOD,
+  createProbe, readCounts, readPhase, phaseOf, overdrawOf, formatOverlayLines,
+  // 供单测直接验证纯函数（生产路径不直接用）
+  _makeHist: makeHist, _histAdd: histAdd, _histPct: histPct, _createThermal: createThermal,
+  _bornScale: bornScale   // TQ-8：与 FX.easeOutElastic 25 点对拍用
+};
+
+});
 __d("game/physics.js", function(require,module,exports){
 // 抛物运动与切割判定 —— design-v1.md 4.3【契约】
 const C = require('./config.js');
@@ -5954,6 +6740,172 @@ const audio = {
 module.exports = audio;
 
 });
+__d("web/perf-probe-host.js", function(require,module,exports){
+// web/perf-probe-host.js —— 切切切性能探针 · H5 壳层接线（规格：docs/性能测量规格-v1.md §2.1/§2.3）
+//
+// 职责（本文件是平台壳，允许 DOM；内核 game/perf-probe.js 仍零平台 API）：
+//   1. 开关判定：location.search 的 perf=1 / overlay=0 / diag=xxx（boot 期判定一次 → 常量）
+//   2. 每帧喂数：frameMs（与 game.noteFrame 同源）/ jsMs（update+render 墙钟）/ 计数 / 档位 / 段
+//   3. 触摸事件计数：独立 {passive:true} 监听，只在 PERF_ON 时挂（默认态零监听）
+//   4. 浮层：绝对定位 <div data-niuma-perf>，4Hz 刷新，≤8 行（规格 §2.3），overlay=0 时不建 DOM
+//   5. 导出：window.__NIUMA_PERF（仅在 perf=1 时挂；默认态 === undefined）
+//
+// 硬约束：
+//   · 绝不包装 / 替换 / 节流 game 内部任何东西（particles 的 slice().sort()、scenes 的 onTouchMove 都是被测对象）
+//   · 只读 game._debug（=内部 g）、game.getTier()、game.noteFrame() 的返回值
+//   · 斜杠后的上限只能读 FX.tierProfile()（C.PERF.dropCap 是死配置，规格 §1 事实 3）
+
+'use strict';
+
+const PP = require('../game/perf-probe.js');
+const FX = require('../game/fx.js');   // 只读 tierProfile()：浮层「168/160*」的斜杠后数字；easeOutElastic：overdrawPx 的出生弹跳曲线
+
+// 规格 §2.5 / T10：overdrawPx 的 easing **单源在 game/fx.js**（particles.js:166 用的同一条）。
+// 探针内核不持公式，只接收这个函数 → 改曲线参数只需改 fx.js 一处，探针不会静默漂移。
+// period 0.3 与 particles.js:166 的传参逐字一致。
+function bornScaleFn(bornNorm) { return FX.easeOutElastic(bornNorm, 0.3); }
+
+const REFRESH_MS = 250;                // 浮层 4Hz（成本/可读性折中，规格 §2.3）
+const HOST_VERSION = 'v1.1';
+
+function nowMs() {
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') return performance.now();
+  return Date.now();
+}
+
+// 开关解析（只此一处解析 URL；默认态 on=false）
+function parseQuery(search) {
+  const out = { on: false, overlay: true, diag: '' };
+  try {
+    const q = new URLSearchParams(search || '');
+    out.on = q.get('perf') === '1';
+    out.overlay = q.get('overlay') !== '0';
+    out.diag = q.get('diag') || '';
+  } catch (e) { /* 老浏览器无 URLSearchParams：保持默认关闭 */ }
+  return out;
+}
+
+// 浮层文本（8 行）：排版函数在核心里（game/perf-probe.js formatOverlayLines）→ 两端逐字同排版。
+// 这里只负责 join 成一个 <div> 的 textContent（一次写文本 = 一次重排，4Hz）
+function overlayText(sn, caps) { return PP.formatOverlayLines(sn, caps).join('\n'); }
+
+// H5 宿主：attach(game) 后由 web/adapter.js 每帧 tick(...)
+function createHost(cfg) {
+  const C = cfg || {};
+  const overlayOn = C.overlay !== false;
+  const diag = C.diag || '';
+  const canvas = C.canvas || null;
+  const getGame = typeof C.getGame === 'function' ? C.getGame : function () { return null; };
+  const doc = (typeof document !== 'undefined') ? document : null;
+
+  const probe = PP.createProbe({
+    carrier: 'h5',
+    overlay: overlayOn,
+    dpr: C.dpr,
+    canvasPx: C.canvasPx,
+    canvasCssPx: C.canvasCssPx,
+    viewScale: C.viewScale,
+    scaleFn: bornScaleFn,          // T10：曲线单源（game/fx.js），探针只接收函数
+    nowMs: nowMs
+  });
+
+  const counts = {};      // 复用对象（每帧零分配）
+  const phase = {};
+  let el = null;
+  let lastRefresh = 0;
+  let touchEvents = 0;    // 本帧累计的 touchmove 事件数（tick 消费后清零）
+  let detachTouch = null;
+
+  function buildOverlay() {
+    if (!overlayOn || !doc || el) return;
+    el = doc.createElement('div');
+    el.setAttribute('data-niuma-perf', '1');
+    el.style.cssText = 'position:fixed;left:6px;top:6px;z-index:2147483000;pointer-events:none;' +
+      'font:11px/1.4 ui-monospace,Menlo,Consolas,monospace;color:#5CFF9D;background:rgba(0,0,0,0.62);' +
+      'padding:4px 6px;border-radius:4px;white-space:pre;text-shadow:0 0 2px #000;max-width:96vw;';
+    el.textContent = 'perf-probe ' + PP.PROBE_VERSION + ' 初始化中…';
+    (doc.body || doc.documentElement).appendChild(el);
+  }
+
+  // 触摸事件计数：独立 passive 监听（不 preventDefault、不碰坐标；默认态不挂）
+  function attachTouchCounter() {
+    if (!canvas || !canvas.addEventListener) return;
+    const onMove = function () { touchEvents++; };
+    canvas.addEventListener('touchmove', onMove, { passive: true });
+    detachTouch = function () { try { canvas.removeEventListener('touchmove', onMove); } catch (e) {} };
+  }
+
+  function attach(game) {
+    if (!game) return null;
+    buildOverlay();
+    attachTouchCounter();
+    const g = game._debug;
+    // 暴露同步出口（默认态 perf 关闭 → 本函数不会被调用 → window.__NIUMA_PERF 保持 undefined）
+    if (typeof window !== 'undefined') {
+      window.__NIUMA_PERF = {
+        version: HOST_VERSION,
+        probeVersion: PP.PROBE_VERSION,
+        snapshot: function (o) { return probe.snapshot(o); },
+        exportText: function (o) { return probe.exportText(o); },
+        // 控制台一句 copy(__NIUMA_PERF.exportText()) 即可（规格 §3.4 第 6 步）
+        // v1.1 / TQ-4：容量 2000 → CSV 约 80–110KB，粘贴内容"明显缺行"时改用分段：
+        //   copy({fromRow:0,maxRows:600}) 逐段复制（每段注释行带 rows/from/count，可自查漏段）
+        copy: function (o) {
+          const txt = probe.exportText(o);
+          if (typeof copy === 'function') { copy(txt); return txt; }   // Chrome DevTools $0 helper
+          if (typeof navigator !== 'undefined' && navigator.clipboard) { try { navigator.clipboard.writeText(txt); } catch (e) {} }
+          return txt;
+        },
+        beginSeg: function (n) { probe.beginSeg(n); },
+        endSeg: function () { return probe.endSeg(); },
+        info: function () {
+          return { carrier: 'h5', overlay: overlayOn, diag: diag, refreshMs: REFRESH_MS, scene: g ? g.scene : '' };
+        }
+      };
+    }
+    return probe;
+  }
+
+  // 每帧：只读喂数（jsMs 由 adapter 用 performance.now 包住 update+render 测得）
+  function tick(frameMs, jsMs, rawFrameMs, tierEvent) {
+    const game = getGame();
+    if (!game) return;
+    const g = game._debug;
+    PP.readCounts(g, counts);
+    PP.readPhase(g, phase);
+    const od = (g && g.round && g.round.particles) ? probe.overdrawOf(g.round.particles) : 0;
+    probe.observePhase(phase, od);
+    const tier = game.getTier ? game.getTier() : 'high';
+    probe.frame(frameMs, rawFrameMs, jsMs, counts, od, touchEvents, tier, tierEvent, phase.phase);
+    // 刀光去重计数放在 frame() 之后：换段复位不会吃掉本帧新出现的刀光
+    probe.observeBlades(g && g.round ? g.round.blades : null);
+    touchEvents = 0;
+
+    if (overlayOn && el) {
+      const t = nowMs();
+      if (t - lastRefresh >= REFRESH_MS) {
+        lastRefresh = t;
+        const t0 = nowMs();
+        const sn = probe.snapshot({ raw: false });
+        const caps = FX.tierProfile(tier);        // 只读取值：斜杠后的当前上限
+        el.textContent = overlayText(sn, caps);
+        probe.noteOverlayCost(nowMs() - t0);      // N8：浮层绘制成本自报
+      }
+    }
+  }
+
+  return {
+    probe,
+    attach,
+    tick,
+    resetTouch() { touchEvents = 0; },
+    detach() { if (detachTouch) { detachTouch(); detachTouch = null; } if (el && el.parentNode) el.parentNode.removeChild(el); el = null; }
+  };
+}
+
+module.exports = { createHost, parseQuery, overlayText, REFRESH_MS, HOST_VERSION };
+
+});
 __d("web/adapter.js", function(require,module,exports){
 // web/adapter.js —— v1.2 变更B 浏览器适配壳（壳层允许 DOM；内核 game/*.js 零平台 API）
 // 只经注入接口使用内核：存储 / 输入归一 / 渲染宿主 / 音频桩 / 随机源。内核零拷贝复用。
@@ -6082,6 +7034,10 @@ function boot() {
   } catch (e) {}
   const rand = mulberry32(seed);
 
+  // 性能探针开关（docs/性能测量规格-v1.md §2.1）：boot 期判定一次。
+  // 默认态（无 ?perf=1）只做一次字符串正则，不加载探针模块、不建 DOM、不挂监听、不建定时器。
+  const PERF_ON = /[?&]perf=1(&|$)/.test(window.location.search || '');
+
   // v1.5 H1：开局先做旧键迁移（双前缀 → 单前缀），再读存档
   migrateLegacyStorage();
 
@@ -6209,16 +7165,36 @@ function boot() {
   document.addEventListener('gesturestart', (e) => { e.preventDefault(); }, { passive: false });
   document.addEventListener('dblclick', (e) => { e.preventDefault(); }, { passive: false });
 
+  // ===== 性能探针接线（docs/性能测量规格-v1.md）=====
+  // 只在 ?perf=1 时加载壳层模块并接线；默认态 perfHost 恒为 null →
+  // frame() 里 `if (perfHost)` 是每帧唯一一次布尔判断（boot 期已是常量，恒假），零 DOM / 零监听 / 零定时器。
+  // 探针只读 game._debug / getTier() / noteFrame() 返回值，不改任何游戏逻辑与绘制路径。
+  let perfHost = null;
+  if (PERF_ON) {
+    try {
+      const hostMod = require('./perf-probe-host.js');
+      const flags = hostMod.parseQuery(window.location.search);
+      perfHost = hostMod.createHost({
+        overlay: flags.overlay,
+        diag: flags.diag,
+        canvas,
+        dpr,
+        canvasPx: { w: canvas.width, h: canvas.height },
+        canvasCssPx: { w: window.innerWidth, h: window.innerHeight },
+        viewScale,
+        getGame: () => game
+      });
+      perfHost.attach(game);
+    } catch (e) { perfHost = null; }   // 探针失败绝不影响可玩性
+  }
+
   // B5 固定逻辑步长：渲染按 rAF，逻辑按 1/60 fixed timestep 累积推进
   const STEP = 1 / 60;
   const MAX_STEPS = 5; // 卡顿帧上限，防螺旋死亡
   let last = performance.now();
   let acc = 0;
-  function frame(ts) {
-    let dt = (ts - last) / 1000;
-    last = ts;
-    if (dt > 0.25) dt = 0.25;
-    if (game.noteFrame) game.noteFrame(dt * 1000); // v1.4 12.6 B3：真实帧时驱动分档
+  // 逻辑推进 + 渲染（默认路径与探针路径共用同一实现，避免两套帧循环漂移）
+  function advance(dt) {
     acc += dt;
     let n = 0;
     while (acc >= STEP && n < MAX_STEPS) { game.update(STEP); acc -= STEP; n++; }
@@ -6229,6 +7205,22 @@ function boot() {
     ctx.scale(viewScale, viewScale);
     game.render(ctx);
     ctx.restore();
+  }
+  function frame(ts) {
+    const prevTs = last;                          // 原始帧差（未 clamp）供探针判 clampHits（规格 T3）
+    let dt = (ts - prevTs) / 1000;
+    last = ts;
+    if (dt > 0.25) dt = 0.25;
+    const tierEvent = game.noteFrame ? game.noteFrame(dt * 1000) : null; // v1.4 12.6 B3：真实帧时驱动分档（返回值只供探针记录档位事件）
+    // ↓ 每帧唯一一次布尔判断：perfHost 是 boot 期一次性判定的常量（默认态恒为 null → 分支永不进入）
+    if (perfHost) {
+      const t0 = performance.now();                                    // jsMs 起点（包住 update+render 墙钟）
+      advance(dt);
+      perfHost.tick(dt * 1000, performance.now() - t0, ts - prevTs, tierEvent);
+      window.requestAnimationFrame(frame);
+      return;
+    }
+    advance(dt);
     window.requestAnimationFrame(frame);
   }
   window.requestAnimationFrame(frame);
